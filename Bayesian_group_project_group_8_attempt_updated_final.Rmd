@@ -1,0 +1,513 @@
+---
+title: "Group project"
+author:
+- Jonathan Otterspeer
+- Niya Neykova
+- Johan Vriend
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: readable
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    code_download: false
+  word_document:
+    toc: true
+    toc_depth: '4'
+  pdf_document:
+    latex_engine: xelatex 
+    toc: true
+    toc_depth: '4'
+subtitle: Group Number 8
+---
+
+```{r setup, include = FALSE}
+options(max.print= 120,
+        width = 90,
+        tibble.width = 80)
+knitr::opts_chunk$set(echo= TRUE,
+                      cache=FALSE,
+                      prompt=FALSE,
+                      tidy="styler",
+                      comment=NA,
+                      message=FALSE,
+                      warning=TRUE)
+
+knitr::opts_knit$set(width=90)
+knitr::opts_chunk$set(cache.extra = knitr::rand_seed)
+set.seed(42)
+knitr::opts_knit$set(root.dir = getwd())
+```
+
+# Checklist {.unnumbered}
+
+The submission includes the following.
+
+-   [ ] RMD document where it's clear what is the code that corresponds to each question.
+-   [ ] Dataset
+-   [ ] html/PDF document with the following
+    -   [ ] Numbered questions and answers with text and all the necessary code.
+    -   [ ] Subtitle indicates the group number
+    -   [ ] Name of all group members
+    -   [ ] Details of specification of the work done by group members (e.g., who found the data, who did the pre-processing, who answered which questions, etc).
+    -   [ ] Statement of technology. Did you use any AI tools? How?
+
+# Group project {.unnumbered}
+
+For the project, we use the following packages:
+
+```{r, message = FALSE}
+## 
+rm(list = ls())
+
+library(cmdstanr)
+library(dplyr)
+library(splines)
+library(janitor)
+library(readr)
+library(brms)
+library(ggplot2)
+library(tidyr)
+library(priorsense)
+options(mc.cores = parallel::detectCores()) # paralellize if possible
+options(brms.file_refit = "on_change") # save the files if the model has changed
+ggplot2::theme_set(ggplot2::theme_light()) # nicer theme
+```
+
+## 1. Dataset Selection (0.5pt)
+
+Select a dataset with clusters such as schools, regions, or people with multiple observations per individual. (From for example, <https://www.kaggle.com/>) It would be a good idea to choose a smallish dataset (not too many rows, e.g., less than 1000) or subset it so that fitting the models doesn't take too long.
+
+a.  Describe the dataset with a couple of short sentences. What was its intended use? Are there papers that reference it? Provide information on how to obtain the dataset, including its source and any necessary preprocessing steps/feature engineering.
+
+The original dataset was the The Real Estate Sales 2001–2022 dataset, which is a record of residential property transactions over twenty-two years (Masidekabakci, 2024). It includes raw sale prices (Sale.Amount), tax-assessed values (Assessed.Value), transaction dates, and various property attributes (e.g. location, size, year built). The data is grouped by time periods (e.g., months or years) and location coordinates. It is used/created for educational purposes for real estate analysis, or exploring patterns/models in property sales over time, but it is mostly useful for regression tasks in predicting sale amounts. However, it is not considered peer-reviewed, and no major papers have used this exact compilation, but similar datasets are used in the literature and Kaggle competitions. It is pulled from Kaggle, the link is:<https://www.kaggle.com/code/masidekabakci/real-estate-sales-2001-2022>.
+
+Preprocessing steps we did include parsing the date field, handling or dropping missing values, converting categorical columns to factors, and (for modeling) log-transforming highly skewed columns like 'sale_amount' and 'assessed_value'. We also converted the 'Location' column to two columns: 'lon' & 'lat', for the spatial GP model. Furthermore, we plotted the histogram of 'Sale_Amount. Lastly, we removed outliers outside the inter quartile range.
+
+```{r}
+# load the data and preprocessing steps go here
+getwd()            # e.g. "/Users/niyaneykova/Desktop/Bayesian Modeling"
+
+# read from the same directory
+real_estate_dataset <- read.csv("/Users/niyaneykova/Desktop/Bayesian Modeling/data/real_estate_dataset.csv")
+
+head(real_estate_dataset)
+
+Realestate <- real_estate_dataset
+Realestate <- Realestate %>%
+  mutate(
+    log_sale      = log(`Sale.Amount`),
+    log_assessed1 = log(`Assessed.Value` + 1)
+  )
+#Select the most useful variables
+Realestate_clean <- Realestate %>%
+  select(`List.Year`, Town, `Sale.Amount`, `Property.Type`, `Residential.Type`, `Assessed.Value`, Season, Non.Use.Code, lon, lat, log_sale, log_assessed1)
+
+#Drop all rows containing missing values and values of zero
+Realestate_clean <- Realestate_clean %>%
+  drop_na() %>%
+  filter(if_all(everything(), ~ . != 0))
+
+#Inspect some variables on there levels
+unique(Realestate_clean$Town)
+unique(Realestate_clean$`Property.Type`)
+unique(Realestate_clean$`Residential.Type`)
+
+str(Realestate_clean)
+
+#Rename columns for use in brms
+Realestate_clean <- clean_names(Realestate_clean)
+
+#Randomly select a 1000 rows as a sample
+Realestate_sample <- Realestate_clean %>%
+  sample_n(550)
+
+# Convert character variables to factors
+Realestate_sample <- Realestate_sample %>%
+  mutate(
+    Town = as.factor(town),
+    `Property.Type` = as.factor(`property_type`),
+    `Residential.Type` = as.factor(`residential_type`)
+  )
+
+# Scale numeric predictor variables
+Realestate_sample <- Realestate_sample %>%
+  mutate(
+    `assessed_value` = log(`assessed_value` + 1),
+    `list_year` = log(`list_year` + 1)
+  )
+
+#Remove outliers from the target variable
+# Calculate Q1 and Q3
+Q1 <- quantile(Realestate_sample$sale_amount, 0.25, na.rm = TRUE)
+Q3 <- quantile(Realestate_sample$sale_amount, 0.75, na.rm = TRUE)
+
+# Calculate IQR
+IQR_value <- Q3 - Q1
+
+# Define bounds
+lower_bound <- Q1 - 1.5 * IQR_value
+upper_bound <- Q3 + 1.5 * IQR_value
+
+# Filter dataset to remove outliers
+Realestate_sample <- Realestate_sample[Realestate_sample$sale_amount >= lower_bound & 
+                                     Realestate_sample$sale_amount <= upper_bound, ]
+
+
+# Rescale the target variable by a factor of 1000 to give more manageble figures
+Realestate_sample$sale_amount <- Realestate_sample$sale_amount / 1000
+
+#Check the target variable
+# Minimum value
+min_value <- min(Realestate_sample$sale_amount, na.rm = TRUE)
+
+# Maximum value
+max_value <- max(Realestate_sample$sale_amount, na.rm = TRUE)
+
+# Print results
+cat("Minimum Sale Amount:", min_value, "\n")
+cat("Maximum Sale Amount:", max_value, "\n")
+
+# Basic histogram of sale_amount
+hist(Realestate_sample$log_sale,
+     main = "Histogram of Sale Amount",
+     xlab = "Sale Amount (in thousands)",
+     col = "lightblue",
+     border = "black")
+# 
+```
+
+b.  Report the number of observations, columns (with their meaning) and their data types. Indicate clearly what you will use as dependent variable/label.
+
+<!-- REPORT IT BELOW -->
+
+After pre-processing of our dataset we have 518 observations and 15 variables remaining.
+
+Our dependent variable will be the sale_amount (numeric), which is the price by which the object has been sold. The dependent variable has been divided by one-thousand to get make the number more manageable to use.
+
+As independent variables we are going to use the following columns: *1. list_year:* the year at which the object was listed for sale as a log transformed number. 2. *Town (categorical)*: the town in which the property is located as a factor with 107 levels 3. *log_assessed:* the assessed value of the object before the sale as a log transformed number (numeric variable). 4. *Season*: the season in which the object was sold as a integer from 1 to 4, making it categorical. 5. *non_use_code (categorical)*: code indicating properties that may not be used for typical purposes (e.g., vacant land) as a integer. 6. *Property.Type* and 7. *Residential.Type* categorical variablees describe the property’s classification type as property and usage. Numeric variables *lon*, and *lat* capture the property’s financial valuation and geographic location.
+
+## 2. Split the data and tranform columns as necessary. (0.5pt)
+
+Split the data into training (80%) and test set (80%). Transform the columns if necessary.
+
+```{r, message = FALSE}
+# Number of observations
+
+n <- nrow(Realestate_sample)
+
+# Create a random sample of 80% row indices
+train_indices <- sample(seq_len(n), size = 0.8 * n)
+
+# Split the data
+train_data <- Realestate_sample[train_indices, ]
+test_data <- Realestate_sample[-train_indices, ]
+```
+
+## 3. Model Exploration (3pt)
+
+a.  Fit multiple appropriate models to the dataset (as many models as there are members in the group, with a minimum of two models). Models might vary in the multilevel structure, informativeness of their priors (but not just trivial changes), model of the data/likelihood, etc. (I recommend not to use no pooling models since they tend to take a long time and it's very hard to assign good priors). **Assess if models converged: Report how the traceplots looks like, highest Rhat, number of effective samples, etc. If didn't converge, address the issues. (If you can't solve the problems, report them and continue with the assignment).**
+
+<!-- message = FALSE, results = "hide" prevents displaying output, if you need to show something create another chunk of code -->
+
+```{r}
+# models go here
+#Calculating Gelman et al. priors.
+intercept_prior <- mean(Realestate_sample$log_sale)
+SD <- sd(Realestate_sample$log_sale)
+slope_prior <-2.5* sd(Realestate_sample$log_sale)
+SD_prior <- 1/ sd(Realestate_sample$log_sale)
+
+intercept_prior
+SD
+slope_prior
+SD_prior
+
+def_priors_s <- c(
+  prior(normal(12, 0.94), class = Intercept),
+  prior(normal(0, 2.33), class = b),
+  prior(exponential(1.07), class = sigma)
+)
+
+#Fitting a first model using pooling based on cities.
+
+Sale_Price_1 <- brm(log_sale ~ (list_year + log_assessed1 + season + non_use_code + (1|Town)),
+             data = train_data,
+             family = gaussian(),
+             prior = def_priors_s,
+             iter = 4000,
+             chains = 4,
+             seed = 123,
+             file = "Sale_Price_1"
+)
+
+Sale_Price_1
+```
+
+Rhat = 1.00 across all parameters show chains converged & Bulk_ESS and Tail_ESS are high, indicating reliable estimates. **Bulk_ESS** ranges from 2638 (for sd(Intercept)) up to 12787 (season). **Tail_ESS** ranges from 4745 for sd(Intercept) up to 6523 for log_assessed1.
+
+The intercept represents the expected log sale price of 2.35 when all predictors are zero (because we have not centered them). There is a modest difference in log sale price across towns, with the average differing by 0.20 (or exp(0.20) = 22%) from the global average.
+
+The intercept and list_year have very large uncertainty. The model estimates a small effect for list_year,with a large standard error, and very wide 95% credible interval crossing 0, suggesting that list_year has no clear effect. The model assumes a linear effect of year, which may be inaccurate. Furthermore, the values for the predictors at 0 are not meaningful for real-world settings, so this result is not "interpretable" for real scenarios.
+
+```{r}
+# Fitting a second model, now also allowing the slopes to vary with the assessed value this because it's reasonable to assume that the are differences in the assessed value per town. Next to that we have also added a horseshoe prior because it might be logical to think that not all variables add information.
+
+def_priors_hs <- c(
+  prior(normal(12, 0.94), class = Intercept),
+  prior(horseshoe(par_ratio = 0.2), class = b),
+  prior(exponential(1.07), class = sigma)
+)
+
+Sale_Price_2 <- brm(log_sale ~ (list_year + log_assessed1 + season + non_use_code + (1 + log_assessed1|Town)),
+             data = train_data,
+             family = gaussian(),
+             prior = def_priors_hs,
+             iter = 4000,
+             control = list(max_treedepth = 12, adapt_delta = 0.999),
+             chains = 4,
+             seed = 123,
+             file = "Sale_Price_2"
+)
+
+Sale_Price_2
+```
+
+All R-hat values show good convergence at 1.00. Next to this Bulk ESS and Tail ESS are all sufficiently high.
+
+The model intercept estimates the log sale price to be 3.29 ( exp ≈ \$27) when all predictors (list_year, log_assessed1, season, and non_use_code) are zero, but with a wide uncertainty. This estimation and interpretation, however, is not the most meaningful in real-world cases. The list_year, season show weak effects which might not be useful. There's stronger variability in log sale prices across towns (3.33), much higher than in model 1, suggesting town differences are more variable now that the slopes also vary with log_assessed.
+
+It is good to keep in mind that the since intercept represents the expected log sale price when all predictors are at zero, since they are not centered, these values are not meaningful in the context of the data (e.g., list_year), making it not directly interpretative in a real-world sense therefore, we need to center some predictors in a meaningful way. Because of this we have centered the list_year variable.
+
+```{r}
+# updated model 3
+
+# loosening the priors for the intercept and slopes
+def_priors_loose <- c(
+  prior(normal(12, 2), class = Intercept),      # mean and sd from data
+  prior(normal(0, 3.5), class = b),                  # looser slope prior
+  prior(exponential(1.07), class = sigma)           
+)
+
+# centering list_year with mean year and logging it for correct interpretation
+train_data <- train_data %>%
+  mutate(list_year_centered = list_year - mean(list_year, na.rm = TRUE))
+
+# model 3
+Sale_Price_3 <- brm(
+  formula = log_sale ~ list_year_centered + log_assessed1 + season + non_use_code + 
+            (1 + log_assessed1 | town),
+  data = train_data,
+  family = gaussian(),
+  prior = def_priors_loose,
+  iter = 4000,
+  chains = 4,
+  seed = 123,
+  control = list(adapt_delta = 0.999, max_treedepth = 12),
+  file = "Sale_Price_3"
+)
+
+Sale_Price_3
+```
+
+All R-hat values are at 1.00, indicating good convergence. Bulk ESS and tail ESS are all sufficiently high.
+
+The expected log sale price is 3.33 for an average year (log centered) with other predictors at zero, and average town effect. Much more reasonable than before but only for the year predictor. There is still large variability in baseline log sale prices across towns (3.33), but meaningful but small effect of log assessed across towns (0.27). The error sigma of 0.52 suggests relative noise.
+
+The intervals for list year and intercept are the largest, also crossing zero for list_year_centered. This indicates there is still no real effect of list_year_centered on the dependent variable.
+
+```{r}
+#Prior sensitivity analysis of model 1
+plot(Sale_Price_1, ask = FALSE)
+```
+
+Traceplots demonstrate good mixing across all four chains, indicating good convergence. The average deviation of the intercept across towns is about 0.20 log-sale units; sigma is centered around 0.55–0.60 making it off by 1.8 for correct individual house price predictions. log_assessed1 and non_use_code are the only meaningful, clearly estimated predictors in this model with tighter confidence intervals. There is moderate variation in baseline prices across towns (0.20) = exp(0.20) = 22% difference in sales across towns
+
+```{r}
+plot(Sale_Price_2, ask = FALSE)
+```
+
+The Intercept and list_year are shrunk towards zero, expected by the horseshoe prior, the traceplots do show some spikes out of the center of the traceplot.
+
+log_assessed1: Histogram shows most values are \> 0, with some spread. The traceplot shows active sampling across chains, not collapsed near zero.This predictor is important and not strongly shrunk; it contributes meaningfully to predicting log sale price.
+
+season: Histogram shows highly concentrated values near 0. The traceplot is well mixed suggesting good convergence.
+
+non_use_code: Histogram also shows values near 0, though with slightly more spread than season.The trace plot show similar patterns.
+
+Further traceplots show some that are not well mixed, for example sdb_list_year.
+
+```{r}
+plot(Sale_Price_3, ask = FALSE)
+```
+
+Model 3 shows mostly stable trace-plots that exceed the two previous models. Only cor_town_intercept_log_assessed1 shows a not well mixed traceplot.
+
+b.  Explain each model and describe its structure (what they assume about potential population-level or group-level effects), and the type of priors used. <!-- EXPLAIN BELOW, REFER TO EACH MODEL -->
+
+Model 1: Our aim was to establish a baseline model. We selected independent variables from the dataset that, based on common sense reasoning, are expected to have the strongest predictive value. These include: list_year, assessed_value, season, non_use_code, and town (used as a grouping variable). Given the distribution of assessed_value, we applied a log transformation to both this variable and the dependent variable to bring them into a more manageable range. For the priors, we opted for weakly informative Gelman priors.
+
+Model 2: For the second model we now also allow the slopes to vary with the assessed value, because it's reasonable to assume that the are differences in the assessed value per town. Next to that, we have added a horseshoe prior because it might be logical to think that not all variables add information. Due to warnings we got we have set the max_treedepth to 12 and the adopt_delta to 0.999.
+
+Model 3: This final version is a multilevel structured model where the slopes vary with the assessed value per town, as in model 2. However, this model improves upon model 2 by widening the intercept and slopes to resolve prior-data conflicts from the prior analysis shown in model 2, while still maintaining some regularization. The priors are set back to Gelmen, as to avoid the over-regularization of the model 2. It also centers the logged list_year feature at the mean as a baseline, rather than 0 as the previous models, making it more real-life interpretible. The population fixed effects are the intercept, list_year_centered, log_assessed, season, non_use_code, which show how they relate to log_price. The group level effects capture the random intercept and random slope, allowing each town to have its own baseline log_price, and additionally each town has its own sensitivity to the assessed value. The priors are loosened enough to let the data speak more, still weakly informative. We used a normal(12, 2) prior on the intercept to center it at the mean log_price with a ± 2-unit deviation, a normal(0, 3.5) prior on all slopes to allow moderately large effects while still shrinking any excessive noise, and an exponential(1.07) prior on sigma to match the data’s residual variability. We additionally used Guassian as a likelihood again, for a comparable model result, despite prices being positive and right-skewed (other distributions were omitted for comparability purposes).
+
+## 4. Model checking (3pt)
+
+a.  Perform a prior sensitivity analysis for each model and modify the model if appropriate. Justify.
+
+```{r}
+#Prior sensitivity analysis of model 1
+powerscale_sensitivity(Sale_Price_1)
+```
+
+```{r}
+#Prior sensitivity analysis of model 2
+powerscale_sensitivity(Sale_Price_2)
+```
+
+```{r}
+#Prior sensitivity analysis of model 3
+powerscale_sensitivity(Sale_Price_3)
+```
+
+<!-- EXPLAIN CONCLUSIONS AND WHETHER MODELS ARE KEPT, MODIFIED  -->
+
+Powerscale sensitivity analysis of model 1 shows weak likelihood/too overpowering priors for the intercept and b_list_year feature, suggesting they are too restricted or tight.
+
+In model 2, again, strong priors for the intercept and b_list_year, with additional prior-data mismatch for season, sd_Town\_\_Intercept, etc., possibly due to over-regularization from the horseshoe prior on the slopes, causing more shrinkage of several effects.
+
+In model 3 we reverted back to Gelman priors which we loosened up for the intercept and slopes. This removed most of the prior-data conflicts. The only prior-data conflict that remained was that for the b_list_year_centered variable.
+
+b.  Conduct posterior predictive checks for each model to assess how well they fit the data. Explain what you conclude.
+
+```{r}
+# Posterior predictive checks for model 1
+pp_check(Sale_Price_1, type = "intervals", x = "log_sale", prob_outer = 0.95)
+```
+
+```{r}
+# Posterior predictive checks for model 1
+pp_check(Sale_Price_1, ndraws = 200) 
+```
+
+```{r}
+# Posterior predictive checks for model 1
+pp_check(Sale_Price_1, type = "stat_2d")
+```
+
+```{r}
+# Posterior predictive checks for model 2
+pp_check(Sale_Price_2, type = "intervals", x = "log_sale", prob_outer = 0.95)
+```
+
+```{r}
+# Posterior predictive checks for model 2
+pp_check(Sale_Price_2, ndraws = 200)
+```
+
+```{r}
+# Posterior predictive checks for model 2
+pp_check(Sale_Price_2, type = "stat_2d")
+```
+
+```{r}
+# Posterior predictive checks for model 3
+pp_check(Sale_Price_3, type = "intervals", x = "log_sale", prob_outer = 0.95)
+```
+
+```{r}
+# Posterior predictive checks for model 3
+pp_check(Sale_Price_3, ndraws = 200)
+```
+
+```{r}
+# Posterior predictive checks for model 3
+pp_check(Sale_Price_3, type = "stat_2d")
+```
+
+<!-- EXPLAIN CONCLUSIONS -->
+
+Model 1: The posterior predictive checks show that the models doesn't give good predictions for the low region. Possible due to the lack of data in this region. The density increases with higher log_sale values, but the interval is wide suggesting a high uncertainty. The model is most confident, showing tighter predictive intervals, for the mid region of the data. The density overlays plot shows the model captures the overall data shape quite well, being a bit on the low side however. The observed distribution (dark blue line) mostly lies within the predictive light blue lines. The last plot of the posterior predictive check shows that the model's simulated distributions of log_sale closely match the observed data for both the mean and standard deviation. The observed dark blue point lies within the simulated points (light blue cloud), which indicates a good fit.
+
+Model 2: The posterior predictive checks for model 2 give the same image as for model 1 but now showing less uncertainty for the major part of the first plot, indicating it has a good fit.
+
+Model 3: The posterior predictive checks show the same results for model 3 as for model 2.
+
+## 5. Model Comparison (1.5pt)
+
+a.  Use k-fold cross-validation to compare the models.
+
+```{r}
+set.seed(123)
+k <- loo::kfold_split_random(K = 10, N = nrow(train_data))
+Sale_Price_1 <- kfold(Sale_Price_1, chains = 1, folds = k, save_fits = FALSE)
+Sale_Price_2 <- kfold(Sale_Price_2, chains = 1, folds = k, save_fits = FALSE) 
+Sale_Price_3 <- kfold(Sale_Price_3, chains = 1, folds = k, save_fits = FALSE) 
+
+print(Sale_Price_1)
+print(Sale_Price_2)
+print(Sale_Price_3)
+
+```
+
+```{r}
+set.seed(123)
+#Question 5
+loo_compare(Sale_Price_1, Sale_Price_2, Sale_Price_3)
+
+#Question 6
+fit <- readRDS("Sale_Price_2.rds")
+
+fx  <- fixef(fit)[-1, ]
+print(head(fx[order(abs(fx[,"Estimate"]), decreasing = TRUE), ], 5), digits = 3)
+
+#Question 7
+set.seed(123)
+pred <- exp(colMeans(posterior_predict(fit, newdata = test_data, allow_new_levels = TRUE)))
+obs  <- exp(test_data$log_sale)
+
+rmse <- sqrt(mean((pred - obs)^2))
+mae  <- mean(abs(pred - obs))
+mape <- mean(abs((pred - obs) / obs)) * 100
+
+cat("RMSE =", rmse, "\n")
+cat("MAE  =", mae,  "\n")
+cat("MAPE =", mape, "%\n")
+```
+
+b.  Determine the best model based on predictive accuracy and justify your decision.
+
+    <!-- DECISION -->
+
+If we compare elpd_diff and se_diff across the three models, we can see that Sale_Price_2 is the best model with both elpd_diff and se_diff being zero, also used as baseline. Sale_Price_1 has an elpd_diff of −25.3 and a se_diff of 14.7. The elpd_diff does differ at least 4 from the baseline model but if we look at the se_diff we can see that it is large and it doesn't pass the 2 \* SE rule. This indicates that Sale_Price_2 and Sale_Price_1 don't differ meaningfully.
+
+Sale_Price_3 falls within the previous two models with a elpd_diff of -0.4 and a se_diff of 1.2. Again, the difference is below the threshold of 2 \* se_diff and the threshold of 4 for the elpd_diff. Overall, Sale_Price_2 is chosen, but with only weak evidence and not being meaningfully better in predictive performance than the other models.
+
+## 6. Interpretation of Important Parameters (1.5pt)
+
+<!-- INTERPRETATION AND CODE GOES HERE -->
+
+Sale prices in this model rise almost proportionally with assessed value: a one-percent increase in the assessed figure translates into roughly a 0.8 percent increase in the expected sale price, so doubling the assessment more than doubles what a property is likely to fetch. By contrast, parcels classified as “Vacant” carry a clear penalty, selling for about eight percent less than comparable properties with the baseline use-code. The calendar year of listing hints at a two-percent annual upward drift in prices, but the wide uncertainty band around that estimate means the data do not rule out the possibility of no real trend at all. Seasonality shows an even smaller, statistically unclear effect, implying that when the property is listed within the year probably does not have much of an effect when taking other factors into account.
+
+## 7. Report a loss function on the test set (Optional for bonus 0.5 to 1pt, depending on if you use RMSE or another function).
+
+Report RMSE or other loss (or utility) function on the test set. (Transform it back if necessary).
+
+We chose RMSE and MAE as loss functions. We first transformed the data from logscale to the original scale, to ensure that the RMSE and MAE are interpretable. The RSME and MAE were 123682.4 and 83957.06 respectively. For the sake of interpretation, we also included MAPE to understand the relative magnitude of the error, which was reported to be 62.3%.
+
+# Contributions of each member
+
+-   Jonathan Otterspeer: model 2, dataset pre-processing, output interpretation, and template code, 5,6,7
+
+-   Niya: model 3, model checking, output interpretation, PDF file, references, questions 1a, 3b, 4a b
+
+-   Johan Vriend: model 1, dataset selection, output interpretation, setting-up code template, 1b, 2, 3a,b
+
+# Statement of technology
+
+During the making of this assignment Chat-GPT was used to deepen knowledge provided during this course. Example of a prompt used: You are a statistician specialized in Bayesian statistics. Explain the exact workings of the horseshoe prior in Bayesian statistics in normal human language. There has been no use of AI tools in assessing and evaluating the models.
+
+# References
+
+Masidekabakci. (2024, December 30). *Real Estate sales 2001-2022*. Kaggle. <https://www.kaggle.com/code/masidekabakci/real-estate-sales-2001-2022>
